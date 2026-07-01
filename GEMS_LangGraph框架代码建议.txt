@@ -1,0 +1,1058 @@
+目标：在已有 GEMS 可跑框架上，做旁路式 LangGraph/LangChain 改造，先跑通稳定 harness，再逐步增强图像生成/编辑能力。
+============================================================
+0. 一句话结论
+============================================================
+
+建议不要直接推翻或大改 GEMS 原框架。
+
+第一版推荐采用“旁路包装”：
+
+1. 保留 GEMS 原有 agent/GEMS.py、agent/base_agent.py、agent/skill_manager.py 和 agent/skills/*/SKILL.md。
+2. 新增 langgraph_harness/ 包装层。
+3. 把 GEMS 已有的 plan -> decompose -> generate -> verify -> refine -> memory-summary -> skill routing 显式包装为 LangGraph 状态图。
+4. 第一版只做 text-to-image，不做复杂图像编辑、不做多工具规划、不做代码画布。
+5. z-image-turbo 没部署完成时，先用 mock generator 或公司已有图像生成 API 跑通 graph harness。
+6. 最先增强两个可落地发力点：
+   - 结构化 verifier：稳定输出失败项和失败标签。
+   - 手部/文字专项 skill：先用 MLLM prompt 检查，后续再替换 OCR、手部检测器或内部视觉评估模型。
+
+推荐技术路线：
+
+GEMS 原始实现 = 图像 agent 研究 baseline
+LangGraph = agent 状态图和执行 harness
+LangChain = LLM client、prompt template、structured output、tool wrapper
+本地 JSONL/artifacts = 轨迹日志和失败案例沉淀
+
+
+============================================================
+1. 依据和当前 GEMS 公开仓库观察
+============================================================
+
+公开仓库：
+https://github.com/lcqysl/GEMS
+
+已核对到的 GEMS 公开仓库结构：
+
+GEMS/
+├── infer.py
+├── agent/
+│   ├── server/
+│   │   ├── kimi.sh
+│   │   ├── qwen_image.py
+│   │   └── z_image.py
+│   ├── skills/
+│   │   ├── aesthetic_drawing/
+│   │   │   └── SKILL.md
+│   │   ├── creative_drawing/
+│   │   │   └── SKILL.md
+│   │   └── ...
+│   ├── base_agent.py
+│   ├── GEMS.py
+│   └── skill_manager.py
+├── eval/
+└── README.md
+
+公开 README 说明：
+
+1. GEMS 使用 Kimi-K2.5 作为 MLLM，Z-Image-Turbo / Qwen-Image-2512 作为 generator。
+2. MLLM 可通过 SGLang 起服务，generator 可通过 Diffusers + API 起服务。
+3. infer.py 是最小推理入口：实例化 GEMS(gen_url, mllm_url, max_iterations)，然后 agent.run({"prompt": TEST_PROMPT})。
+4. skill 格式为 agent/skills/<skill_id>/SKILL.md。
+5. SkillManager 使用正则解析 SKILL.md 中的 Description 和 Instructions。
+
+公开代码中 GEMS.py 的关键逻辑：
+
+1. plan(original_prompt)
+   - 从 SkillManager 获取 skill manifest。
+   - 用 MLLM 判断是否触发某个 skill。
+   - 如果触发 skill，则根据 skill instructions 增强 prompt。
+
+2. decompose(prompt)
+   - 让 MLLM 把用户需求拆成 yes/no questions。
+   - 这些 questions 后续作为 verifier 检查项。
+
+3. generate(current_prompt)
+   - 来自 BaseAgent.generate。
+   - 通过 requests.post(gen_url, params={"prompt": prompt}) 调用 generator server。
+
+4. verify_image(image_bytes, questions)
+   - 对每个 yes/no question 调用 MLLM。
+   - 当前判断比较简单：answer 中有 yes 且没有 no 则 passed。
+
+5. summarize experience
+   - 根据当前 prompt、passed/failed requirements、thought、previous experiences 让 MLLM 总结经验。
+
+6. refine prompt
+   - 根据 attempt history、failed points、experience 和历史图像，让 MLLM 生成下一轮 prompt。
+
+7. run(item)
+   - 先 plan，再 decompose。
+   - 循环 max_iterations 轮：
+     generate -> verify -> 如果全通过则返回 -> 否则 summarize -> refine。
+   - 如果达到最大轮数，返回通过项最多的 best image。
+
+当前 GEMS 的优点：
+
+1. 流程简单清晰，适合实习阶段学习和复现。
+2. 已经具备 agent loop、memory summary、skill routing 三个关键设计。
+3. 生成器和 MLLM 通过 HTTP server 解耦，后续可以替换模型。
+4. skill 以 SKILL.md 形式维护，扩展门槛低。
+
+当前 GEMS 的不足，也是我们可以改进的地方：
+
+1. run() 是单个大循环，状态隐含在局部变量里，不利于调试、恢复、可视化和单节点测试。
+2. verifier 输出不够结构化，只做 yes/no，缺少 failure_tags、confidence、suggested_fix。
+3. 日志主要是 print，缺少可复现的 JSONL 轨迹。
+4. memory 是自然语言经验摘要，缺少结构化失败案例库。
+5. 对手部、文字、空间、属性绑定等高频失败类型没有专项 verifier/skill。
+6. server timeout 或 MLLM crash 时，目前更多依靠重跑脚本补齐，harness 层可以做得更稳。
+
+
+============================================================
+2. 总体改造原则
+============================================================
+
+2.1 不要第一步就原地重构
+
+不建议一开始直接大改 agent/GEMS.py，因为：
+
+1. 原框架已经能跑，是 baseline。
+2. z-image-turbo 还在部署中，直接改主流程会增加排错维度。
+3. 实习阶段最好先拿到一个可比较的结果：原 GEMS vs LangGraph harness。
+
+推荐：
+
+1. 原始 GEMS 保留。
+2. 新增旁路入口 run_langgraph_gems.py。
+3. 新增 langgraph_harness/。
+4. 如果 LangGraph harness 出问题，原 infer.py 仍然可用。
+
+2.2 第一版只支持 text-to-image
+
+不要第一版就做这些：
+
+1. 多图输入编辑。
+2. 局部 mask 编辑。
+3. MetaPoint 空间 token。
+4. GenClaw 代码画布。
+5. 多 agent 协作。
+6. 数据库和复杂 dashboard。
+
+第一版只做：
+
+输入 prompt
+-> skill routing
+-> plan/enhance prompt
+-> decompose checklist
+-> generate image
+-> structured verify
+-> refine prompt
+-> regenerate
+-> save final image and trajectory
+
+2.3 先跑通 harness，再增强模型能力
+
+z-image-turbo 暂时没部署好时，仍然可以推进：
+
+1. 用 MockGenerator 返回固定测试图或占位图路径。
+2. 用公司已有图像生成 API 占位。
+3. 甚至第一版 GeneratorNode 只返回 artifact path，不真实生成图，用于测试状态流和日志。
+
+这样可以把问题拆开：
+
+模型部署问题归模型部署；
+harness 设计问题归 harness；
+verifier 结构问题归 verifier。
+
+
+============================================================
+3. 推荐新增目录结构
+============================================================
+
+建议在 GEMS repo 根目录新增：
+
+GEMS/
+├── run_langgraph_gems.py
+├── langgraph_harness/
+│   ├── __init__.py
+│   ├── states.py
+│   ├── schemas.py
+│   ├── graph.py
+│   ├── nodes.py
+│   ├── routing.py
+│   ├── prompts.py
+│   ├── config.py
+│   ├── adapters/
+│   │   ├── __init__.py
+│   │   ├── gems_adapter.py
+│   │   ├── generator_adapter.py
+│   │   └── mllm_adapter.py
+│   ├── evaluators/
+│   │   ├── __init__.py
+│   │   ├── structured_verifier.py
+│   │   ├── hand_quality.py
+│   │   └── text_rendering.py
+│   ├── memory/
+│   │   ├── __init__.py
+│   │   ├── run_logger.py
+│   │   └── experience_store.py
+│   ├── skills/
+│   │   ├── hand_quality_skill.md
+│   │   └── text_rendering_skill.md
+│   └── examples/
+│       ├── prompts_week3.jsonl
+│       └── mock_run_config.yaml
+├── outputs/
+│   └── langgraph_runs/
+└── configs/
+    └── langgraph_gems.yaml
+
+每个文件的职责：
+
+1. run_langgraph_gems.py
+   - 新入口。
+   - 加载 config。
+   - 构造 GEMSAdapter。
+   - 编译 LangGraph。
+   - 执行单个 prompt 或 prompts_week3.jsonl。
+
+2. states.py
+   - 定义 AgentState。
+   - 只放状态字段，不写业务逻辑。
+
+3. schemas.py
+   - 定义结构化输出 schema。
+   - 包括 VisualCheck、VerifyResult、AttemptRecord、SkillInfo。
+
+4. graph.py
+   - 使用 StateGraph 定义节点和边。
+   - 控制 generate -> verify -> refine 的循环。
+
+5. nodes.py
+   - 实现 planner_node、decomposer_node、skill_router_node、generator_node、verifier_node、refiner_node、memory_writer_node。
+
+6. routing.py
+   - 实现 should_continue / stop_router。
+   - 根据 passed、iteration、max_iterations 决定 END 或 refine。
+
+7. prompts.py
+   - 放 planner/decomposer/verifier/refiner 的 prompt 模板。
+   - 不要把 prompt 散落在节点函数里。
+
+8. adapters/gems_adapter.py
+   - 适配现有 GEMS 类。
+   - 对外提供 plan、decompose、generate、think、think_with_thought 等方法。
+   - 第一版可以直接持有 agent = GEMS(...)。
+
+9. evaluators/
+   - 放结构化 verifier 和专项评估逻辑。
+   - 第一版内部还是调用 MLLM，后续可以替换 OCR、手部检测器。
+
+10. memory/run_logger.py
+   - 写 JSONL 日志。
+   - 保存每轮 prompt、image path、verify result、failure tags、refined prompt。
+
+11. memory/experience_store.py
+   - 第一版可以只读写本地 JSONL。
+   - 后续可升级向量库或数据库。
+
+12. langgraph_harness/skills/
+   - 放本次新增专项 skill。
+   - 不替代 agent/skills，第一版可由 SkillRouter 同时读取两个目录。
+
+
+============================================================
+4. AgentState 设计
+============================================================
+
+建议使用 TypedDict 或 Pydantic BaseModel。
+
+如果希望 LangGraph 简单兼容，第一版建议 TypedDict：
+
+```python
+from typing import TypedDict, NotRequired, Literal
+
+class AgentState(TypedDict):
+    # run identity
+    run_id: str
+    task_id: str
+
+    # input
+    original_prompt: str
+    current_prompt: str
+    task_type: Literal["text_to_image"]
+
+    # config
+    max_iterations: int
+    iteration: int
+
+    # planning
+    triggered_skills: list[dict]
+    skill_instructions: str
+    plan_text: str
+    atomic_checks: list[str]
+
+    # generation artifacts
+    image_bytes: NotRequired[bytes]
+    image_path: NotRequired[str]
+    best_image_path: NotRequired[str]
+    best_passed_count: int
+
+    # verification
+    verify_result: NotRequired[dict]
+    passed_checks: list[str]
+    failed_checks: list[str]
+    failure_tags: list[str]
+    suggested_fix: str
+    confidence: float
+
+    # memory
+    attempt_history: list[dict]
+    memory_summary: str
+
+    # debug and artifacts
+    artifact_dir: str
+    logs: list[str]
+    errors: list[str]
+    final_status: NotRequired[Literal["success", "max_iter_reached", "error"]]
+```
+
+核心原则：
+
+1. 节点只读自己需要的字段，返回需要更新的字段。
+2. 所有可复现信息必须落到 state 或 JSONL，不只 print。
+3. 图像本身可以存 path，不建议长期把 bytes 都塞进日志。
+4. image_bytes 可以在 state 中短暂传递，但每轮都要写入 artifact_dir。
+
+
+============================================================
+5. 结构化 schema 建议
+============================================================
+
+建议 schemas.py 中定义：
+
+```python
+from pydantic import BaseModel, Field
+from typing import Literal
+
+FailureTag = Literal[
+    "hand_error",
+    "text_render_error",
+    "spatial_error",
+    "attribute_binding_error",
+    "style_error",
+    "counting_error",
+    "object_missing",
+    "object_extra",
+    "background_error",
+    "low_visual_quality",
+    "unknown_error",
+]
+
+class VisualCheck(BaseModel):
+    question: str
+    passed: bool
+    evidence: str = ""
+    failure_tags: list[FailureTag] = Field(default_factory=list)
+    suggested_fix: str = ""
+    confidence: float = 0.0
+
+class VerifyResult(BaseModel):
+    passed: bool
+    checks: list[VisualCheck]
+    failed_checks: list[str]
+    failure_tags: list[FailureTag]
+    suggested_fix: str
+    confidence: float
+
+class AttemptRecord(BaseModel):
+    iteration: int
+    prompt: str
+    image_path: str
+    verify_result: VerifyResult
+    memory_summary: str = ""
+    refined_prompt: str = ""
+```
+
+为什么要结构化：
+
+1. refiner 需要知道具体失败原因，而不是只知道 yes/no。
+2. 后续可以统计最常见失败类型。
+3. 手部、文字、空间等专项优化需要 failure_tags 触发。
+4. 内部 AI 写代码时，更容易生成单元测试。
+
+
+============================================================
+6. LangGraph 状态图设计
+============================================================
+
+推荐 graph：
+
+START
+  -> skill_router
+  -> planner
+  -> decomposer
+  -> generator
+  -> verifier
+  -> memory_writer
+  -> route_after_verify
+        if success: END
+        if max_iter_reached: END
+        else: refiner -> generator
+
+伪代码：
+
+```python
+from langgraph.graph import StateGraph, START, END
+from langgraph_harness.states import AgentState
+from langgraph_harness.nodes import (
+    skill_router_node,
+    planner_node,
+    decomposer_node,
+    generator_node,
+    verifier_node,
+    refiner_node,
+    memory_writer_node,
+)
+from langgraph_harness.routing import route_after_verify
+
+def build_graph(checkpointer=None):
+    graph = StateGraph(AgentState)
+
+    graph.add_node("skill_router", skill_router_node)
+    graph.add_node("planner", planner_node)
+    graph.add_node("decomposer", decomposer_node)
+    graph.add_node("generator", generator_node)
+    graph.add_node("verifier", verifier_node)
+    graph.add_node("memory_writer", memory_writer_node)
+    graph.add_node("refiner", refiner_node)
+
+    graph.add_edge(START, "skill_router")
+    graph.add_edge("skill_router", "planner")
+    graph.add_edge("planner", "decomposer")
+    graph.add_edge("decomposer", "generator")
+    graph.add_edge("generator", "verifier")
+    graph.add_edge("verifier", "memory_writer")
+
+    graph.add_conditional_edges(
+        "memory_writer",
+        route_after_verify,
+        {
+            "success": END,
+            "retry": "refiner",
+            "max_iter_reached": END,
+            "error": END,
+        },
+    )
+    graph.add_edge("refiner", "generator")
+
+    return graph.compile(checkpointer=checkpointer)
+```
+
+route_after_verify 伪代码：
+
+```python
+def route_after_verify(state: AgentState) -> str:
+    if state.get("errors"):
+        return "error"
+    if state.get("verify_result", {}).get("passed") is True:
+        return "success"
+    if state["iteration"] >= state["max_iterations"]:
+        return "max_iter_reached"
+    return "retry"
+```
+
+注意：
+
+1. iteration 建议在 generator_node 或 memory_writer_node 增加。
+2. 如果 generator 报错，node 应捕获异常写入 errors，而不是直接让整个进程崩掉。
+3. 第一版可以不用 checkpointer；第二版加入 SqliteSaver 或 MemorySaver。
+
+
+============================================================
+7. 节点伪代码
+============================================================
+
+7.1 GEMSAdapter
+
+```python
+class GEMSAdapter:
+    def __init__(self, gen_url: str, mllm_url: str, max_iterations: int):
+        self.agent = GEMS(gen_url=gen_url, mllm_url=mllm_url, max_iterations=max_iterations)
+
+    def plan(self, prompt: str) -> str:
+        return self.agent.plan(prompt)
+
+    def decompose(self, prompt: str) -> list[str]:
+        return self.agent.decompose(prompt)
+
+    def generate(self, prompt: str) -> bytes:
+        return self.agent.generate(prompt)
+
+    def think(self, prompt: str, images: list[bytes] | None = None) -> str:
+        return self.agent.think(prompt, images=images or [])
+
+    def think_with_thought(self, prompt: str, images: list[bytes] | None = None):
+        return self.agent.think_with_thought(prompt, images=images or [])
+```
+
+后续如果不想依赖 GEMS 类，也可以拆成更底层的 MLLMClient 和 GeneratorClient。
+
+7.2 skill_router_node
+
+职责：
+
+1. 读取 GEMS 原 agent/skills。
+2. 读取新增 langgraph_harness/skills。
+3. 根据 prompt 选择触发 skill。
+4. 第一版可以直接复用 GEMS.plan 的技能路由，也可以自己写规则。
+
+建议第一版：
+
+1. 继续复用 GEMS plan 里的 skill routing。
+2. 额外用规则强制触发专项 skill：
+   - prompt 含 hand, hands, finger, fingers, holding -> hand_quality_skill
+   - prompt 含 text, word, letters, poster, logo, sign, exact text -> text_rendering_skill
+
+伪代码：
+
+```python
+def skill_router_node(state: AgentState, runtime) -> dict:
+    prompt = state["original_prompt"].lower()
+    skills = []
+
+    if any(k in prompt for k in ["hand", "hands", "finger", "fingers", "holding"]):
+        skills.append(load_local_skill("hand_quality_skill"))
+
+    if any(k in prompt for k in ["text", "word", "letters", "poster", "logo", "sign", "exact text"]):
+        skills.append(load_local_skill("text_rendering_skill"))
+
+    return {
+        "triggered_skills": skills,
+        "skill_instructions": merge_skill_instructions(skills),
+    }
+```
+
+7.3 planner_node
+
+职责：
+
+1. 输入 original_prompt + skill_instructions。
+2. 输出 current_prompt / plan_text。
+3. 可复用 GEMS.plan，也可自定义 prompt。
+
+伪代码：
+
+```python
+def planner_node(state: AgentState, runtime) -> dict:
+    adapter = runtime.context["gems_adapter"]
+
+    if state["skill_instructions"]:
+        task = f"""
+        Enhance the image generation prompt using the skill instructions.
+        Keep the original intent.
+        Make constraints explicit.
+
+        Original prompt:
+        {state["original_prompt"]}
+
+        Skill instructions:
+        {state["skill_instructions"]}
+
+        Return only the enhanced prompt.
+        """
+        enhanced = adapter.think(task).strip()
+    else:
+        enhanced = adapter.plan(state["original_prompt"])
+
+    return {
+        "current_prompt": enhanced,
+        "plan_text": enhanced,
+    }
+```
+
+7.4 decomposer_node
+
+职责：
+
+1. 把 original_prompt 拆成 yes/no checklist。
+2. 对手部/文字任务补专项检查项。
+
+伪代码：
+
+```python
+def decomposer_node(state: AgentState, runtime) -> dict:
+    adapter = runtime.context["gems_adapter"]
+    checks = adapter.decompose(state["original_prompt"])
+
+    tags = [s["id"] for s in state.get("triggered_skills", [])]
+
+    if "hand_quality_skill" in tags:
+        checks.extend([
+            "Are the hands anatomically plausible?",
+            "Does each visible hand have the correct number of fingers?",
+            "Are the fingers not fused, duplicated, or severely distorted?",
+        ])
+
+    if "text_rendering_skill" in tags:
+        checks.extend([
+            "Is the required text present exactly as requested?",
+            "Is the text readable and correctly spelled?",
+            "Is the text placed in the requested region or object?",
+        ])
+
+    checks = dedupe_keep_order(checks)
+    return {"atomic_checks": checks}
+```
+
+7.5 generator_node
+
+职责：
+
+1. 调用 generator。
+2. 保存图像。
+3. 更新 iteration。
+4. 如果模型未部署，支持 mock generator。
+
+伪代码：
+
+```python
+def generator_node(state: AgentState, runtime) -> dict:
+    adapter = runtime.context["gems_adapter"]
+    artifact_dir = Path(state["artifact_dir"])
+    iteration = state["iteration"] + 1
+
+    try:
+        if runtime.context.get("use_mock_generator"):
+            image_bytes = make_mock_image_bytes(state["current_prompt"])
+        else:
+            image_bytes = adapter.generate(state["current_prompt"])
+
+        image_path = artifact_dir / f"round_{iteration:02d}.png"
+        image_path.write_bytes(image_bytes)
+
+        return {
+            "iteration": iteration,
+            "image_bytes": image_bytes,
+            "image_path": str(image_path),
+        }
+    except Exception as e:
+        return {
+            "errors": state.get("errors", []) + [f"Generator error: {e}"],
+            "iteration": iteration,
+        }
+```
+
+7.6 verifier_node
+
+职责：
+
+1. 输入 image + atomic_checks。
+2. 输出 VerifyResult。
+3. 必须结构化。
+4. 先用 MLLM prompt 结构化输出 JSON，后续可换专用 evaluator。
+
+建议 verifier prompt：
+
+```text
+You are a strict image generation verifier.
+Evaluate the image against each checklist item.
+Return ONLY valid JSON.
+
+Failure tags must be selected from:
+hand_error, text_render_error, spatial_error, attribute_binding_error,
+style_error, counting_error, object_missing, object_extra,
+background_error, low_visual_quality, unknown_error.
+
+JSON schema:
+{
+  "passed": boolean,
+  "checks": [
+    {
+      "question": string,
+      "passed": boolean,
+      "evidence": string,
+      "failure_tags": [string],
+      "suggested_fix": string,
+      "confidence": number
+    }
+  ],
+  "failed_checks": [string],
+  "failure_tags": [string],
+  "suggested_fix": string,
+  "confidence": number
+}
+```
+
+伪代码：
+
+```python
+def verifier_node(state: AgentState, runtime) -> dict:
+    adapter = runtime.context["gems_adapter"]
+    image_bytes = Path(state["image_path"]).read_bytes()
+
+    prompt = build_structured_verifier_prompt(state["atomic_checks"])
+    raw = adapter.think(prompt, images=[image_bytes])
+    verify_result = parse_verify_json(raw)
+
+    passed_checks = [c.question for c in verify_result.checks if c.passed]
+    failed_checks = [c.question for c in verify_result.checks if not c.passed]
+
+    # best image tracking
+    best_passed_count = state.get("best_passed_count", -1)
+    updates = {}
+    if len(passed_checks) > best_passed_count:
+        updates["best_passed_count"] = len(passed_checks)
+        updates["best_image_path"] = state["image_path"]
+
+    updates.update({
+        "verify_result": verify_result.model_dump(),
+        "passed_checks": passed_checks,
+        "failed_checks": failed_checks,
+        "failure_tags": verify_result.failure_tags,
+        "suggested_fix": verify_result.suggested_fix,
+        "confidence": verify_result.confidence,
+    })
+    return updates
+```
+
+7.7 refiner_node
+
+职责：
+
+1. 根据失败项、failure_tags、suggested_fix、memory_summary 和 attempt_history 生成下一轮 prompt。
+2. 保护已经通过的要求，避免 regression。
+
+伪代码：
+
+```python
+def refiner_node(state: AgentState, runtime) -> dict:
+    adapter = runtime.context["gems_adapter"]
+
+    task = f"""
+    Refine the image generation prompt.
+
+    Original intent:
+    {state["original_prompt"]}
+
+    Current prompt:
+    {state["current_prompt"]}
+
+    Passed checks:
+    {state["passed_checks"]}
+
+    Failed checks:
+    {state["failed_checks"]}
+
+    Failure tags:
+    {state["failure_tags"]}
+
+    Suggested fix:
+    {state["suggested_fix"]}
+
+    Memory summary:
+    {state["memory_summary"]}
+
+    Requirements:
+    1. Explicitly fix the failed checks.
+    2. Preserve passed checks.
+    3. If text_render_error appears, quote the exact required text.
+    4. If hand_error appears, add clear anatomical constraints.
+    5. Avoid conflicting instructions.
+    6. Return only the new prompt.
+    """
+
+    refined = adapter.think(task, images=[Path(state["image_path"]).read_bytes()]).strip()
+    return {"current_prompt": refined}
+```
+
+7.8 memory_writer_node
+
+职责：
+
+1. 保存每轮 attempt record。
+2. 写 JSONL。
+3. 生成或更新 memory_summary。
+
+伪代码：
+
+```python
+def memory_writer_node(state: AgentState, runtime) -> dict:
+    adapter = runtime.context["gems_adapter"]
+    logger = runtime.context["run_logger"]
+
+    record = {
+        "run_id": state["run_id"],
+        "iteration": state["iteration"],
+        "prompt": state["current_prompt"],
+        "image_path": state.get("image_path"),
+        "verify_result": state.get("verify_result"),
+        "failed_checks": state.get("failed_checks", []),
+        "failure_tags": state.get("failure_tags", []),
+    }
+    logger.write_attempt(record)
+
+    summary_task = build_memory_summary_prompt(
+        current_prompt=state["current_prompt"],
+        verify_result=state["verify_result"],
+        previous_memory=state.get("memory_summary", ""),
+    )
+    try:
+        image_bytes = Path(state["image_path"]).read_bytes()
+        memory_summary = adapter.think(summary_task, images=[image_bytes]).strip()
+    except Exception:
+        memory_summary = state.get("memory_summary", "")
+
+    attempt_history = state.get("attempt_history", []) + [record]
+    return {
+        "attempt_history": attempt_history,
+        "memory_summary": memory_summary,
+    }
+```
+
+
+============================================================
+8. LangChain 使用位置
+============================================================
+
+LangChain 不建议作为主状态图，但适合做这些：
+
+1. LLM client
+   - ChatOpenAI 或兼容 OpenAI API 的公司内部模型。
+   - GEMS 的 BaseAgent 已经用 OpenAI(api_key="none", base_url=mllm_url)，可以先保留。
+
+2. PromptTemplate
+   - planner/decomposer/verifier/refiner prompt 模板化。
+   - 避免 prompt 散落在代码中。
+
+3. Structured output
+   - verifier 输出 VerifyResult。
+   - 如果内部模型支持 JSON mode 或 tool calling，优先用 structured output。
+   - 如果不支持，先用 parse_verify_json 做容错解析。
+
+4. Tool wrapping
+   - generator server 包装为 tool。
+   - OCR、手部检测、CLIPScore、aesthetic scorer 后续也包装为 tool。
+
+示例：
+
+```python
+from langchain_core.prompts import ChatPromptTemplate
+
+VERIFIER_PROMPT = ChatPromptTemplate.from_messages([
+    ("system", "You are a strict image generation verifier. Return only JSON."),
+    ("user", "{checklist_text}")
+])
+```
+
+
+============================================================
+9. LangGraph 使用位置
+============================================================
+
+LangGraph 用来解决 GEMS 当前大循环不够稳定的问题：
+
+1. 显式状态：
+   - AgentState 中保留 prompt、checks、image_path、verify_result、iteration。
+
+2. 条件边：
+   - verifier passed -> END。
+   - failed and iteration < max_iterations -> refiner。
+   - failed and iteration >= max_iterations -> END。
+
+3. checkpoint：
+   - 第一版可以不用。
+   - 第二版建议加入 MemorySaver 或 SQLite checkpointer。
+   - 好处是中途 MLLM crash、generator timeout 后可恢复。
+
+4. human-in-the-loop 预留：
+   - 后续可以在 verifier 后加 interrupt。
+   - 让人确认是否接受图像或手动改 prompt。
+
+5. streaming/logging：
+   - 后续可接 LangSmith。
+   - 第一版先本地 JSONL。
+
+
+============================================================
+10. 新增专项 Skill 设计
+============================================================
+
+10.1 hand_quality_skill.md
+
+建议路径：
+langgraph_harness/skills/hand_quality_skill.md
+
+内容建议：
+
+```markdown
+# Skill: Hand Quality Verification and Prompt Refinement
+
+## Description
+Improve and verify human hand quality in image generation tasks, especially finger count, finger separation, hand anatomy, grasping posture, occlusion, and hand-object interaction.
+
+## Instructions
+When the prompt includes visible hands, fingers, holding, grasping, touching, or hand-object interaction:
+
+1. Make the number of visible hands explicit.
+2. Specify that each visible hand should be anatomically plausible.
+3. Specify correct finger count when fingers are visible.
+4. Avoid fused, duplicated, melted, or extra fingers.
+5. Specify natural hand pose and realistic object contact.
+6. During verification, check:
+   - Are hands visible if required?
+   - Does each visible hand have plausible anatomy?
+   - Are fingers separated and not duplicated?
+   - Is the object held naturally?
+7. If hand quality fails, tag the failure as hand_error and suggest a prompt refinement.
+```
+
+10.2 text_rendering_skill.md
+
+建议路径：
+langgraph_harness/skills/text_rendering_skill.md
+
+内容建议：
+
+```markdown
+# Skill: Exact Text Rendering Verification and Prompt Refinement
+
+## Description
+Improve and verify exact text rendering in image generation tasks, especially posters, signs, logos, book covers, product labels, UI mockups, and any prompt requiring exact readable text.
+
+## Instructions
+When the prompt requires exact text:
+
+1. Preserve the exact target text in quotation marks.
+2. Specify where the text should appear.
+3. Specify that the text must be readable, correctly spelled, and not distorted.
+4. Avoid adding extra unwanted letters or pseudo-text.
+5. During verification, check:
+   - Is the exact requested text present?
+   - Is spelling correct?
+   - Is the text readable?
+   - Is the placement correct?
+   - Are there unwanted extra text fragments?
+6. If text quality fails, tag the failure as text_render_error and suggest a prompt refinement.
+```
+
+注意：
+
+第一版 skill 可以不接复杂模型，先作为 prompt instruction。
+后续升级：
+
+1. text_rendering_skill -> OCR evaluator。
+2. hand_quality_skill -> hand keypoint detector / internal VLM evaluator。
+
+
+============================================================
+11. 轨迹日志设计
+============================================================
+
+推荐 artifact 目录：
+
+outputs/langgraph_runs/{run_id}/
+├── config.json
+├── input.json
+├── attempts.jsonl
+├── final_report.json
+├── round_01.png
+├── round_02.png
+└── ...
+
+attempts.jsonl 每行：
+
+```json
+{
+  "run_id": "20260622_153012_xxxx",
+  "iteration": 1,
+  "original_prompt": "...",
+  "current_prompt": "...",
+  "image_path": "outputs/langgraph_runs/.../round_01.png",
+  "passed_checks": ["..."],
+  "failed_checks": ["..."],
+  "failure_tags": ["text_render_error"],
+  "suggested_fix": "...",
+  "confidence": 0.82,
+  "memory_summary": "...",
+  "latency_ms": 123456
+}
+```
+
+final_report.json：
+
+```json
+{
+  "run_id": "...",
+  "final_status": "success|max_iter_reached|error",
+  "final_image_path": "...",
+  "best_image_path": "...",
+  "best_passed_count": 7,
+  "total_checks": 9,
+  "iterations": 3,
+  "common_failure_tags": ["hand_error", "text_render_error"]
+}
+```
+
+为什么先用 JSONL：
+
+1. 简单可靠，不需要数据库。
+2. 方便内部 AI 读取。
+3. 方便人工查问题。
+4. 后续可无痛导入数据库、LangSmith 或评估平台。
+
+
+============================================================
+12. 配置文件建议
+============================================================
+
+configs/langgraph_gems.yaml：
+
+```yaml
+gems:
+  gen_url: "http://127.0.0.1:8001/generate"
+  mllm_url: "http://127.0.0.1:8000/v1"
+  max_iterations: 5
+
+harness:
+  use_mock_generator: false
+  artifact_root: "outputs/langgraph_runs"
+  save_image_bytes_in_state: false
+  enable_jsonl_logger: true
+  enable_checkpoint: false
+
+verifier:
+  mode: "mllm_json"
+  strict_json: false
+  max_repair_attempts: 2
+  failure_tags:
+    - hand_error
+    - text_render_error
+    - spatial_error
+    - attribute_binding_error
+    - style_error
+    - counting_error
+    - object_missing
+    - object_extra
+    - background_error
+    - low_visual_quality
+    - unknown_error
+
+skills:
+  enable_original_gems_skills: true
+  enable_harness_skills: true
+  harness_skills_dir: "langgraph_harness/skills"
+
+debug:
+  verbose: true
+```
+
+run_langgraph_gems.py 启动参数：
+
+```bash
+python run_langgraph_gems.py --config configs/langgraph_gems.yaml --prompt "a poster with the exact text AI AGENT WEEK 3"
+
+python run_langgraph_gems.py --config configs/langgraph_gems.yaml --prompts langgraph_harness/examples/prompts_week3.jsonl
+
+python run_langgraph_gems.py --config configs/langgraph_gems.yaml --mock
+```

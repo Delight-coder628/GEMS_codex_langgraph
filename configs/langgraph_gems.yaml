@@ -1,0 +1,23 @@
+mllm:
+  base_url: "${MLLM_BASE_URL}"
+  api_key: "${MLLM_API_KEY}"
+  model: "${MLLM_MODEL}"
+  timeout_seconds: 600
+  max_retries: 2
+
+generator:
+  url: "${GENERATOR_URL}"
+  timeout_seconds: 600
+  max_retries: 1
+  width: 1024
+  height: 1024
+  num_inference_steps: 9
+  guidance_scale: 0.0
+  seed: null
+
+agent:
+  max_iterations: 5
+  verifier_repair_attempts: 2
+  artifact_root: "outputs/langgraph_runs"
+  skills_dir: "agent/skills"
+  verbose: true

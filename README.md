@@ -49,6 +49,26 @@ cd GEMS
 pip install requests openai torch tqdm
 ```
 
+### LangGraph + Ascend NPU Harness
+
+This repository also includes a side-by-side LangGraph text-to-image harness for
+Z-Image-Turbo. It keeps the original `infer.py` baseline and adds structured
+verification, retry routing, JSONL trajectories, mock testing, and a ModelArts
+Ascend 910B service that can use one or two selected NPUs.
+
+```bash
+pip install -r requirements.txt
+
+# No MLLM or NPU is required for this workflow smoke test.
+python run_langgraph_gems.py \
+  --config configs/langgraph_gems.yaml \
+  --prompt "a red apple" \
+  --mock
+```
+
+For company MLLM configuration, ModelArts setup, single/dual-card commands, and
+the complete file map, see [GEMS_LANGGRAPH_GUIDE.md](GEMS_LANGGRAPH_GUIDE.md).
+
 ### Start Server
 We use [Kimi-K2.5](https://huggingface.co/moonshotai/Kimi-K2.5) as the MLLM and [Z-Image-Turbo](https://huggingface.co/Tongyi-MAI/Z-Image-Turbo) / [Qwen-Image-2512](https://huggingface.co/Qwen/Qwen-Image-2512) as the Generator. 
 We use Sglang to serve MLLM and Diffusers to serve the Generator.

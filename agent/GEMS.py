@@ -68,8 +68,22 @@ PLANNER_DECISION_PROMPT = (
 )
 
 class GEMS(BaseAgent):
-    def __init__(self, gen_url, mllm_url, max_iterations):
-        super().__init__(gen_url, mllm_url)
+    def __init__(
+        self,
+        gen_url,
+        mllm_url,
+        max_iterations,
+        mllm_api_key="",
+        mllm_model="",
+        request_timeout=600.0,
+    ):
+        super().__init__(
+            gen_url,
+            mllm_url,
+            mllm_api_key=mllm_api_key,
+            mllm_model=mllm_model,
+            request_timeout=request_timeout,
+        )
         self.max_iterations = max_iterations
 
     def decompose(self, prompt: str) -> list:
