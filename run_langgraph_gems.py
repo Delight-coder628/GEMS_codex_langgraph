@@ -12,6 +12,7 @@ from langgraph_harness.config import AppConfig
 from langgraph_harness.graph import build_graph
 from langgraph_harness.mock_clients import MockGeneratorClient, MockMLLMClient
 from langgraph_harness.nodes import NodeDependencies
+from langgraph_harness.ocr import HttpOCRClient, MockOCRClient, PaddleOCRClient
 from langgraph_harness.run_logger import RunLogger
 from langgraph_harness.states import AgentState
 
@@ -100,6 +101,8 @@ def initial_state(
         "failure_tags": [],
         "suggested_fix": "",
         "confidence": 0.0,
+        "ocr_result": {},
+        "ocr_score": {},
         "attempt_history": [],
         "memory_summary": "",
         "logs": [],
@@ -109,7 +112,10 @@ def initial_state(
 
 
 def run_item(
-    config: AppConfig, item: Dict[str, str], mock: bool = False
+    config: AppConfig,
+    item: Dict[str, str],
+    mock: bool = False,
+    ocr_client: Any = None,
 ) -> Dict[str, Any]:
     run_id = make_run_id()
     artifact_dir = str(Path(config.agent.artifact_root) / run_id)
@@ -123,6 +129,7 @@ def run_item(
     if mock:
         mllm = MockMLLMClient()
         generator = MockGeneratorClient()
+        ocr = ocr_client or MockOCRClient(text=item["prompt"])
     else:
         mllm = MLLMClient(
             base_url=config.mllm.base_url,
@@ -137,11 +144,13 @@ def run_item(
             max_retries=config.generator.max_retries,
             request_style="json",
         )
+        ocr = ocr_client or make_ocr_client(config)
 
     dependencies = NodeDependencies(
         config=config,
         mllm=mllm,
         generator=generator,
+        ocr=ocr,
         logger=logger,
         skill_manager=SkillManager(config.agent.skills_dir),
     )
@@ -155,6 +164,17 @@ def run_item(
     )
     recursion_limit = max(50, config.agent.max_iterations * 10 + 20)
     return graph.invoke(state, {"recursion_limit": recursion_limit})
+
+
+def make_ocr_client(config: AppConfig):
+    if not config.ocr.enabled:
+        return None
+    if config.ocr.backend == "http":
+        return HttpOCRClient(
+            url=config.ocr.url,
+            timeout=config.ocr.timeout_seconds,
+        )
+    return PaddleOCRClient(use_angle_cls=True, lang="ch")
 
 
 def main() -> int:

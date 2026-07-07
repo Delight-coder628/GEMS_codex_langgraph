@@ -30,5 +30,10 @@ When this skill is active, rewrite the user's prompt by applying the following s
 - Use strong, directive verbs such as "rendered," "inscribed," "embossed," "spelled out," or "stenciled."
 - Always wrap the target text in double quotation marks to signal its importance to the diffusion model's encoder.
 
+6. **Exact Text Preservation**
+- Preserve the requested text exactly as written by the user.
+- Do not translate, paraphrase, autocorrect, abbreviate, or add extra words inside the quoted target text.
+- If the user provides multiple text strings, keep each one quoted separately and specify its placement.
+
 ## Output Format
 Return ONLY the final enhanced prompt text. Do not include any conversational filler, introductory remarks, or prefixes like "Enhanced prompt:".

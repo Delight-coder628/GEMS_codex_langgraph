@@ -1,7 +1,14 @@
 import json
 from pathlib import Path
 
-from langgraph_harness.config import AgentConfig, AppConfig, GeneratorConfig, MLLMConfig
+from langgraph_harness.config import (
+    AgentConfig,
+    AppConfig,
+    GeneratorConfig,
+    MLLMConfig,
+    OCRConfig,
+)
+from langgraph_harness.ocr import MockOCRClient
 from run_langgraph_gems import run_item
 
 
@@ -31,3 +38,57 @@ def test_mock_graph_writes_complete_artifacts(tmp_path: Path) -> None:
     report = json.loads((run_dir / "final_report.json").read_text(encoding="utf-8"))
     assert report["final_status"] == "success"
     assert report["iterations"] == 1
+
+
+def test_mock_text_prompt_with_ocr_match_writes_ocr_artifact(tmp_path: Path) -> None:
+    config = AppConfig(
+        mllm=MLLMConfig(),
+        generator=GeneratorConfig(),
+        ocr=OCRConfig(enabled=True),
+        agent=AgentConfig(
+            max_iterations=2,
+            artifact_root=str(tmp_path),
+            skills_dir="agent/skills",
+            verbose=False,
+        ),
+    )
+    result = run_item(
+        config,
+        {"task_id": "test", "prompt": 'A poster saying "AI AGENT WEEK 3"'},
+        mock=True,
+        ocr_client=MockOCRClient(text="AI AGENT WEEK 3", confidence=0.98),
+    )
+
+    assert result["final_status"] == "success"
+    run_dir = Path(result["artifact_dir"])
+    ocr_result = json.loads((run_dir / "ocr_round_01.json").read_text(encoding="utf-8"))
+    assert ocr_result["ocr_score"]["passed"] is True
+    report = json.loads((run_dir / "final_report.json").read_text(encoding="utf-8"))
+    assert report["ocr_score"]["exact_match"] is True
+
+
+def test_mock_text_prompt_with_ocr_mismatch_retries(tmp_path: Path) -> None:
+    config = AppConfig(
+        mllm=MLLMConfig(),
+        generator=GeneratorConfig(),
+        ocr=OCRConfig(enabled=True, normalized_match_threshold=0.95),
+        agent=AgentConfig(
+            max_iterations=1,
+            artifact_root=str(tmp_path),
+            skills_dir="agent/skills",
+            verbose=False,
+        ),
+    )
+    result = run_item(
+        config,
+        {"task_id": "test", "prompt": 'A poster saying "AI AGENT WEEK 3"'},
+        mock=True,
+        ocr_client=MockOCRClient(text="WRONG TEXT", confidence=0.98),
+    )
+
+    assert result["final_status"] == "max_iter_reached"
+    assert "text_render_error" in result["failure_tags"]
+    run_dir = Path(result["artifact_dir"])
+    ocr_result = json.loads((run_dir / "ocr_round_01.json").read_text(encoding="utf-8"))
+    assert ocr_result["ocr_score"]["passed"] is False
+    assert ocr_result["ocr_score"]["failure_reason"] == "ocr_text_mismatch"

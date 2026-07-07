@@ -11,6 +11,10 @@ from langgraph_harness.parsing import (
     parse_string_list,
     parse_verify_result,
 )
+from langgraph_harness.ocr import (
+    extract_target_texts,
+    score_ocr_result,
+)
 from langgraph_harness.prompts import (
     DECOMPOSER_PROMPT,
     JSON_REPAIR_PROMPT,
@@ -38,6 +42,7 @@ class NodeDependencies:
     config: AppConfig
     mllm: Any
     generator: Any
+    ocr: Any
     logger: RunLogger
     skill_manager: SkillManager
 
@@ -298,6 +303,114 @@ class GEMSNodes:
             "best_image_path": best_path,
         }
 
+    def ocr_verifier(self, state: AgentState) -> Dict[str, Any]:
+        if state["errors"]:
+            return {}
+        selected = {item["id"] for item in state["triggered_skills"]}
+        if (
+            not self.deps.config.ocr.enabled
+            or "text_rendering" not in selected
+            or self.deps.ocr is None
+        ):
+            return {"ocr_result": {}, "ocr_score": {}}
+
+        targets = extract_target_texts(state["original_prompt"])
+        if not targets:
+            targets = extract_target_texts(state["current_prompt"])
+        if not targets:
+            return {"ocr_result": {}, "ocr_score": {}}
+
+        target = targets[0]
+        try:
+            ocr_result = self.deps.ocr.recognize(state["image_path"])
+            score = score_ocr_result(
+                target,
+                ocr_result,
+                min_confidence=self.deps.config.ocr.min_confidence,
+                normalized_match_threshold=(
+                    self.deps.config.ocr.normalized_match_threshold
+                ),
+            )
+        except Exception as exc:
+            return {
+                "errors": state["errors"] + ["OCR verifier error: {}".format(exc)]
+            }
+
+        artifact = {
+            "target_texts": targets,
+            "target_text": target,
+            "ocr_result": ocr_result.to_dict(),
+            "ocr_score": score.to_dict(),
+        }
+        self.deps.logger.write_ocr_result(state["iteration"], artifact)
+
+        verify_result = dict(state["verify_result"])
+        checks = list(verify_result.get("checks", []))
+        check_question = 'Does OCR read the exact requested text "{}"?'.format(target)
+        check = {
+            "question": check_question,
+            "passed": score.passed,
+            "evidence": (
+                'OCR read "{}" with confidence {:.3f}, similarity {:.3f}.'.format(
+                    score.recognized_text or "<none>",
+                    score.confidence,
+                    score.similarity,
+                )
+            ),
+            "failure_tags": [] if score.passed else ["text_render_error"],
+            "suggested_fix": "" if score.passed else score.suggested_fix,
+            "confidence": score.confidence,
+        }
+        checks.append(check)
+        verify_result["checks"] = checks
+
+        passed_checks = list(state["passed_checks"])
+        failed_checks = list(state["failed_checks"])
+        failure_tags = list(state["failure_tags"])
+        suggested_fix = state["suggested_fix"]
+        if score.passed:
+            passed_checks = _dedupe(passed_checks + [check_question])
+        else:
+            failed_checks = _dedupe(failed_checks + [check_question])
+            failure_tags = _dedupe(failure_tags + ["text_render_error"])
+            suggested_fix = _join_fixes(suggested_fix, score.suggested_fix)
+
+        verify_result["failed_checks"] = failed_checks
+        verify_result["failure_tags"] = failure_tags
+        verify_result["suggested_fix"] = suggested_fix
+        verify_result["passed"] = bool(verify_result.get("passed")) and score.passed
+        confidences = [
+            item.get("confidence", 0.0)
+            for item in checks
+            if isinstance(item, dict)
+        ]
+        if confidences:
+            verify_result["confidence"] = sum(confidences) / len(confidences)
+
+        best_count = state["best_passed_count"]
+        best_path = state["best_image_path"]
+        if len(passed_checks) > best_count:
+            best_count = len(passed_checks)
+            best_path = state["image_path"]
+
+        self._log(
+            '[ocr_verifier] target="{}" read="{}" passed={}'.format(
+                target, score.recognized_text or "<none>", score.passed
+            )
+        )
+        return {
+            "verify_result": verify_result,
+            "passed_checks": passed_checks,
+            "failed_checks": failed_checks,
+            "failure_tags": failure_tags,
+            "suggested_fix": suggested_fix,
+            "confidence": verify_result.get("confidence", state["confidence"]),
+            "best_passed_count": best_count,
+            "best_image_path": best_path,
+            "ocr_result": ocr_result.to_dict(),
+            "ocr_score": score.to_dict(),
+        }
+
     def memory_writer(self, state: AgentState) -> Dict[str, Any]:
         image_bytes = (
             Path(state["image_path"]).read_bytes()
@@ -334,6 +447,7 @@ class GEMSNodes:
             failure_tags=state["failure_tags"],
             suggested_fix=state["suggested_fix"],
             confidence=state["confidence"],
+            ocr_score=state["ocr_score"],
             memory_summary=summary,
             latency_ms=state["generation_latency_ms"],
             errors=state["errors"],
@@ -390,6 +504,7 @@ class GEMSNodes:
             "common_failure_tags": RunLogger.common_tags(
                 state["attempt_history"]
             ),
+            "ocr_score": state["ocr_score"],
             "errors": state["errors"],
         }
         report_path = self.deps.logger.write_json(
@@ -401,3 +516,11 @@ class GEMSNodes:
             "final_image_path": final_image,
             "final_report_path": report_path,
         }
+
+
+def _join_fixes(existing: str, new: str) -> str:
+    if not existing:
+        return new
+    if not new or new in existing:
+        return existing
+    return "{} {}".format(existing.rstrip(), new)

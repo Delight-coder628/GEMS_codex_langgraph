@@ -1,0 +1,6 @@
+# Optional OCR dependencies for the GEMS + LangGraph text-rendering verifier.
+# Choose the paddlepaddle build that matches the company server environment.
+# In an offline intranet, download wheels/model files in an internet-enabled
+# environment first, then upload them to the target server.
+paddleocr
+paddlepaddle

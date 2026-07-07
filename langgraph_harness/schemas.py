@@ -53,6 +53,7 @@ class AttemptRecord(BaseModel):
     failure_tags: List[FailureTag] = Field(default_factory=list)
     suggested_fix: str = ""
     confidence: float = 0.0
+    ocr_score: dict = Field(default_factory=dict)
     memory_summary: str = ""
     latency_ms: int = 0
     errors: List[str] = Field(default_factory=list)

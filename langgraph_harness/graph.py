@@ -18,6 +18,7 @@ def build_graph(dependencies: NodeDependencies):
     graph.add_node("decomposer", nodes.decomposer)
     graph.add_node("generator", nodes.generator)
     graph.add_node("verifier", nodes.verifier)
+    graph.add_node("ocr_verifier", nodes.ocr_verifier)
     graph.add_node("memory_writer", nodes.memory_writer)
     graph.add_node("refiner", nodes.refiner)
     graph.add_node("finalizer", nodes.finalizer)
@@ -39,7 +40,8 @@ def build_graph(dependencies: NodeDependencies):
         route_after_generate,
         {"verify": "verifier", "error": "finalizer"},
     )
-    graph.add_edge("verifier", "memory_writer")
+    graph.add_edge("verifier", "ocr_verifier")
+    graph.add_edge("ocr_verifier", "memory_writer")
     graph.add_conditional_edges(
         "memory_writer",
         route_after_verify,

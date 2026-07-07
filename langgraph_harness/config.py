@@ -62,6 +62,17 @@ class GeneratorConfig(BaseModel):
     seed: Optional[int] = Field(default=None, ge=0)
 
 
+class OCRConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = False
+    backend: str = Field(default="paddle_local", pattern="^(paddle_local|http)$")
+    url: str = ""
+    timeout_seconds: float = Field(default=60.0, gt=0)
+    min_confidence: float = Field(default=0.5, ge=0.0, le=1.0)
+    normalized_match_threshold: float = Field(default=0.8, ge=0.0, le=1.0)
+
+
 class AgentConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -77,14 +88,19 @@ class AppConfig(BaseModel):
 
     mllm: MLLMConfig
     generator: GeneratorConfig
+    ocr: OCRConfig = Field(default_factory=OCRConfig)
     agent: AgentConfig
 
     @model_validator(mode="after")
-    def validate_generator_url(self) -> "AppConfig":
+    def validate_urls(self) -> "AppConfig":
         if self.generator.url and not self.generator.url.startswith(
             ("http://", "https://")
         ):
             raise ValueError("generator.url must start with http:// or https://")
+        if self.ocr.url and not self.ocr.url.startswith(("http://", "https://")):
+            raise ValueError("ocr.url must start with http:// or https://")
+        if self.ocr.enabled and self.ocr.backend == "http" and not self.ocr.url:
+            raise ValueError("ocr.url is required when ocr.backend is http.")
         return self
 
     @classmethod

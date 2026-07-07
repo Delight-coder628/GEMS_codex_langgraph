@@ -30,6 +30,9 @@ class RunLogger:
         path.write_bytes(content)
         return str(path)
 
+    def write_ocr_result(self, iteration: int, data: Dict[str, Any]) -> str:
+        return self.write_json("ocr_round_{:02d}.json".format(iteration), data)
+
     def write_final_report(self, report: FinalReport) -> str:
         return self.write_json("final_report.json", report.model_dump())
 

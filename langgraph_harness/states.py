@@ -24,6 +24,8 @@ class AgentState(TypedDict):
     failure_tags: List[str]
     suggested_fix: str
     confidence: float
+    ocr_result: Dict[str, Any]
+    ocr_score: Dict[str, Any]
     attempt_history: List[Dict[str, Any]]
     memory_summary: str
     logs: List[str]

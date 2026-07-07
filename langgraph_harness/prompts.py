@@ -12,6 +12,8 @@ User request:
 PLANNER_PROMPT = """Rewrite the image-generation request into one clear, complete
 prompt for Z-Image-Turbo. Preserve the user's intent and exact requested text.
 Apply the selected skill instructions without introducing conflicting details.
+Never translate, paraphrase, autocorrect, abbreviate, or add extra words to quoted
+target text requested by the user.
 Return only the rewritten prompt.
 
 Original request:
@@ -96,6 +98,10 @@ Requirements:
 1. Explicitly address failed checks.
 2. Preserve passed checks and the original intent.
 3. Quote exact requested text.
-4. Avoid conflicting or conversational language.
+4. When OCR or text rendering failed, make the text larger, sharper, higher
+contrast, less distorted, and placed on a clean flat surface.
+5. Never translate, paraphrase, autocorrect, abbreviate, or add extra words to
+the requested text.
+6. Avoid conflicting or conversational language.
 Image from the failed attempt: <image>
 """
