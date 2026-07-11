@@ -2,7 +2,13 @@ from pathlib import Path
 
 import pytest
 
-from langgraph_harness.config import AppConfig
+from langgraph_harness.config import (
+    AgentConfig,
+    AppConfig,
+    EditorConfig,
+    GeneratorConfig,
+    MLLMConfig,
+)
 
 
 CONFIG = """
@@ -44,3 +50,13 @@ def test_config_rejects_missing_mllm_values(
 
     with pytest.raises(ValueError, match="Missing required MLLM"):
         AppConfig.from_yaml(str(path))
+
+
+def test_config_requires_editor_url_when_enabled() -> None:
+    with pytest.raises(ValueError, match="editor.url is required"):
+        AppConfig(
+            mllm=MLLMConfig(),
+            generator=GeneratorConfig(),
+            editor=EditorConfig(enabled=True),
+            agent=AgentConfig(),
+        )

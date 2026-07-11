@@ -10,7 +10,9 @@ from agent.clients import GeneratorClient, MLLMClient
 from agent.skill_manager import SkillManager
 from langgraph_harness.config import AppConfig
 from langgraph_harness.graph import build_graph
+from langgraph_harness.editor import EditorClient, MockEditorClient
 from langgraph_harness.mock_clients import MockGeneratorClient, MockMLLMClient
+from langgraph_harness.mock_clients import MOCK_PNG
 from langgraph_harness.nodes import NodeDependencies
 from langgraph_harness.ocr import HttpOCRClient, MockOCRClient, PaddleOCRClient
 from langgraph_harness.run_logger import RunLogger
@@ -103,6 +105,14 @@ def initial_state(
         "confidence": 0.0,
         "ocr_result": {},
         "ocr_score": {},
+        "ocr_constraints": [],
+        "ocr_instances": [],
+        "ocr_diagnosis": {},
+        "recommended_action": "",
+        "actual_action": "",
+        "edit_attempts": 0,
+        "editor_latency_ms": 0,
+        "pending_edit": {},
         "attempt_history": [],
         "memory_summary": "",
         "logs": [],
@@ -116,6 +126,7 @@ def run_item(
     item: Dict[str, str],
     mock: bool = False,
     ocr_client: Any = None,
+    editor_client: Any = None,
 ) -> Dict[str, Any]:
     run_id = make_run_id()
     artifact_dir = str(Path(config.agent.artifact_root) / run_id)
@@ -130,6 +141,9 @@ def run_item(
         mllm = MockMLLMClient()
         generator = MockGeneratorClient()
         ocr = ocr_client or MockOCRClient(text=item["prompt"])
+        editor = editor_client or (
+            MockEditorClient(MOCK_PNG) if config.editor.enabled else None
+        )
     else:
         mllm = MLLMClient(
             base_url=config.mllm.base_url,
@@ -145,12 +159,14 @@ def run_item(
             request_style="json",
         )
         ocr = ocr_client or make_ocr_client(config)
+        editor = editor_client or make_editor_client(config)
 
     dependencies = NodeDependencies(
         config=config,
         mllm=mllm,
         generator=generator,
         ocr=ocr,
+        editor=editor,
         logger=logger,
         skill_manager=SkillManager(config.agent.skills_dir),
     )
@@ -175,6 +191,16 @@ def make_ocr_client(config: AppConfig):
             timeout=config.ocr.timeout_seconds,
         )
     return PaddleOCRClient(use_angle_cls=True, lang="ch")
+
+
+def make_editor_client(config: AppConfig):
+    if not config.editor.enabled:
+        return None
+    return EditorClient(
+        url=config.editor.url,
+        timeout=config.editor.timeout_seconds,
+        max_retries=config.editor.max_retries,
+    )
 
 
 def main() -> int:

@@ -17,11 +17,15 @@ def route_after_generate(
 
 def route_after_verify(
     state: AgentState,
-) -> Literal["success", "retry", "max_iter_reached", "error"]:
+) -> Literal["success", "retry", "local_edit", "max_iter_reached", "error"]:
     if state["errors"]:
         return "error"
     if state["verify_result"].get("passed") is True:
         return "success"
+    if state.get("recommended_action") == "local_edit" and state.get(
+        "pending_edit"
+    ):
+        return "local_edit"
     if state["iteration"] >= state["max_iterations"]:
         return "max_iter_reached"
     return "retry"

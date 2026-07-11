@@ -30,8 +30,22 @@ class RunLogger:
         path.write_bytes(content)
         return str(path)
 
-    def write_ocr_result(self, iteration: int, data: Dict[str, Any]) -> str:
-        return self.write_json("ocr_round_{:02d}.json".format(iteration), data)
+    def write_ocr_result(
+        self, iteration: int, data: Dict[str, Any], edit_attempt: int = 0
+    ) -> str:
+        suffix = "_edit_{:02d}".format(edit_attempt) if edit_attempt else ""
+        return self.write_json(
+            "ocr_round_{:02d}{}.json".format(iteration, suffix), data
+        )
+
+    def write_edit_image(
+        self, iteration: int, edit_attempt: int, content: bytes
+    ) -> str:
+        path = self.artifact_dir / "edit_round_{:02d}_{:02d}.png".format(
+            iteration, edit_attempt
+        )
+        path.write_bytes(content)
+        return str(path)
 
     def write_final_report(self, report: FinalReport) -> str:
         return self.write_json("final_report.json", report.model_dump())

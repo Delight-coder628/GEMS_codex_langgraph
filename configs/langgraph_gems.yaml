@@ -23,6 +23,14 @@ ocr:
   min_confidence: 0.5
   normalized_match_threshold: 0.8
 
+editor:
+  enabled: false
+  url: "${EDITOR_URL}"
+  timeout_seconds: 600
+  max_retries: 1
+  max_edits_per_run: 1
+  mask_padding_ratio: 0.25
+
 agent:
   max_iterations: 5
   verifier_repair_attempts: 2

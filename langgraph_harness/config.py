@@ -73,6 +73,17 @@ class OCRConfig(BaseModel):
     normalized_match_threshold: float = Field(default=0.8, ge=0.0, le=1.0)
 
 
+class EditorConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = False
+    url: str = ""
+    timeout_seconds: float = Field(default=600.0, gt=0)
+    max_retries: int = Field(default=1, ge=0, le=10)
+    max_edits_per_run: int = Field(default=1, ge=0, le=5)
+    mask_padding_ratio: float = Field(default=0.25, ge=0.0, le=2.0)
+
+
 class AgentConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -89,6 +100,7 @@ class AppConfig(BaseModel):
     mllm: MLLMConfig
     generator: GeneratorConfig
     ocr: OCRConfig = Field(default_factory=OCRConfig)
+    editor: EditorConfig = Field(default_factory=EditorConfig)
     agent: AgentConfig
 
     @model_validator(mode="after")
@@ -101,6 +113,10 @@ class AppConfig(BaseModel):
             raise ValueError("ocr.url must start with http:// or https://")
         if self.ocr.enabled and self.ocr.backend == "http" and not self.ocr.url:
             raise ValueError("ocr.url is required when ocr.backend is http.")
+        if self.editor.url and not self.editor.url.startswith(("http://", "https://")):
+            raise ValueError("editor.url must start with http:// or https://")
+        if self.editor.enabled and not self.editor.url:
+            raise ValueError("editor.url is required when editor is enabled.")
         return self
 
     @classmethod

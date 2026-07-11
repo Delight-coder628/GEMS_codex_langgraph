@@ -12,9 +12,13 @@ from langgraph_harness.parsing import (
     parse_verify_result,
 )
 from langgraph_harness.ocr import (
+    build_detected_instances,
+    build_text_constraints,
+    diagnose_ocr_result,
     extract_target_texts,
     score_ocr_result,
 )
+from langgraph_harness.editor import build_polygon_mask, build_text_edit_prompt
 from langgraph_harness.prompts import (
     DECOMPOSER_PROMPT,
     JSON_REPAIR_PROMPT,
@@ -43,6 +47,7 @@ class NodeDependencies:
     mllm: Any
     generator: Any
     ocr: Any
+    editor: Any
     logger: RunLogger
     skill_manager: SkillManager
 
@@ -312,19 +317,50 @@ class GEMSNodes:
             or "text_rendering" not in selected
             or self.deps.ocr is None
         ):
-            return {"ocr_result": {}, "ocr_score": {}}
+            return {
+                "ocr_result": {},
+                "ocr_score": {},
+                "ocr_constraints": [],
+                "ocr_instances": [],
+                "ocr_diagnosis": {},
+                "recommended_action": "",
+                "pending_edit": {},
+            }
 
         targets = extract_target_texts(state["original_prompt"])
         if not targets:
             targets = extract_target_texts(state["current_prompt"])
         if not targets:
-            return {"ocr_result": {}, "ocr_score": {}}
+            return {
+                "ocr_result": {},
+                "ocr_score": {},
+                "ocr_constraints": [],
+                "ocr_instances": [],
+                "ocr_diagnosis": {},
+                "recommended_action": "",
+                "pending_edit": {},
+            }
 
-        target = targets[0]
+        constraints = build_text_constraints(targets)
         try:
             ocr_result = self.deps.ocr.recognize(state["image_path"])
-            score = score_ocr_result(
-                target,
+            instances = build_detected_instances(ocr_result)
+            diagnosis = diagnose_ocr_result(
+                constraints,
+                instances,
+                min_confidence=self.deps.config.ocr.min_confidence,
+                normalized_match_threshold=(
+                    self.deps.config.ocr.normalized_match_threshold
+                ),
+                editor_enabled=(
+                    self.deps.config.editor.enabled
+                    and self.deps.editor is not None
+                    and state["edit_attempts"]
+                    < self.deps.config.editor.max_edits_per_run
+                ),
+            )
+            legacy_score = score_ocr_result(
+                targets[0],
                 ocr_result,
                 min_confidence=self.deps.config.ocr.min_confidence,
                 normalized_match_threshold=(
@@ -338,47 +374,68 @@ class GEMSNodes:
 
         artifact = {
             "target_texts": targets,
-            "target_text": target,
+            "constraints": [item.to_dict() for item in constraints],
+            "instances": [item.to_dict() for item in instances],
+            "diagnosis": diagnosis.to_dict(),
             "ocr_result": ocr_result.to_dict(),
-            "ocr_score": score.to_dict(),
+            "legacy_ocr_score": legacy_score.to_dict(),
+            "ocr_score": legacy_score.to_dict(),
         }
-        self.deps.logger.write_ocr_result(state["iteration"], artifact)
+        self.deps.logger.write_ocr_result(
+            state["iteration"], artifact, state["edit_attempts"]
+        )
 
         verify_result = dict(state["verify_result"])
         checks = list(verify_result.get("checks", []))
-        check_question = 'Does OCR read the exact requested text "{}"?'.format(target)
-        check = {
-            "question": check_question,
-            "passed": score.passed,
-            "evidence": (
-                'OCR read "{}" with confidence {:.3f}, similarity {:.3f}.'.format(
-                    score.recognized_text or "<none>",
-                    score.confidence,
-                    score.similarity,
-                )
-            ),
-            "failure_tags": [] if score.passed else ["text_render_error"],
-            "suggested_fix": "" if score.passed else score.suggested_fix,
-            "confidence": score.confidence,
+        structured_checks = []
+        match_by_constraint = {
+            item.constraint_id: item for item in diagnosis.matches
         }
-        checks.append(check)
+        for constraint in constraints:
+            match = match_by_constraint.get(constraint.id)
+            passed = bool(match and match.passed)
+            question = 'Does OCR read the exact requested text "{}"?'.format(
+                constraint.text
+            )
+            structured_checks.append(question)
+            checks.append(
+                {
+                    "question": question,
+                    "passed": passed,
+                    "evidence": (
+                        'OCR matched "{}" with confidence {:.3f}, similarity {:.3f}.'.format(
+                            match.detected_text, match.confidence, match.similarity
+                        )
+                        if match
+                        else "OCR found no matching text instance."
+                    ),
+                    "failure_tags": [] if passed else ["text_render_error"],
+                    "suggested_fix": "" if passed else diagnosis.suggested_fix,
+                    "confidence": match.confidence if match else 0.0,
+                }
+            )
         verify_result["checks"] = checks
 
         passed_checks = list(state["passed_checks"])
         failed_checks = list(state["failed_checks"])
         failure_tags = list(state["failure_tags"])
         suggested_fix = state["suggested_fix"]
-        if score.passed:
-            passed_checks = _dedupe(passed_checks + [check_question])
+        if diagnosis.passed:
+            passed_checks = _dedupe(passed_checks + structured_checks)
         else:
-            failed_checks = _dedupe(failed_checks + [check_question])
+            failed = [
+                item["question"] for item in checks[-len(constraints) :] if not item["passed"]
+            ]
+            failed_checks = _dedupe(failed_checks + failed)
             failure_tags = _dedupe(failure_tags + ["text_render_error"])
-            suggested_fix = _join_fixes(suggested_fix, score.suggested_fix)
+            suggested_fix = _join_fixes(suggested_fix, diagnosis.suggested_fix)
 
         verify_result["failed_checks"] = failed_checks
         verify_result["failure_tags"] = failure_tags
         verify_result["suggested_fix"] = suggested_fix
-        verify_result["passed"] = bool(verify_result.get("passed")) and score.passed
+        verify_result["passed"] = (
+            bool(verify_result.get("passed")) and diagnosis.passed
+        )
         confidences = [
             item.get("confidence", 0.0)
             for item in checks
@@ -393,9 +450,15 @@ class GEMSNodes:
             best_count = len(passed_checks)
             best_path = state["image_path"]
 
+        pending_edit = _pending_edit(diagnosis, instances)
+        action = diagnosis.recommended_action
+        if action == "local_edit" and not pending_edit:
+            action = "refine_prompt"
         self._log(
-            '[ocr_verifier] target="{}" read="{}" passed={}'.format(
-                target, score.recognized_text or "<none>", score.passed
+            "[ocr_verifier] {}/{} targets passed action={}".format(
+                sum(item.passed for item in diagnosis.matches),
+                len(constraints),
+                action,
             )
         )
         return {
@@ -408,8 +471,65 @@ class GEMSNodes:
             "best_passed_count": best_count,
             "best_image_path": best_path,
             "ocr_result": ocr_result.to_dict(),
-            "ocr_score": score.to_dict(),
+            "ocr_score": legacy_score.to_dict(),
+            "ocr_constraints": [item.to_dict() for item in constraints],
+            "ocr_instances": [item.to_dict() for item in instances],
+            "ocr_diagnosis": diagnosis.to_dict(),
+            "recommended_action": action,
+            "pending_edit": pending_edit,
         }
+
+    def editor(self, state: AgentState) -> Dict[str, Any]:
+        pending = state.get("pending_edit") or {}
+        if (
+            not pending
+            or self.deps.editor is None
+            or not self.deps.config.editor.enabled
+            or state["edit_attempts"] >= self.deps.config.editor.max_edits_per_run
+        ):
+            return {
+                "recommended_action": "refine_prompt",
+                "actual_action": "editor_fallback",
+                "pending_edit": {},
+            }
+        started = time.monotonic()
+        try:
+            mask = build_polygon_mask(
+                state["image_path"],
+                pending["polygon"],
+                self.deps.config.editor.mask_padding_ratio,
+            )
+            prompt = build_text_edit_prompt(
+                pending["target_text"], pending["detected_text"]
+            )
+            content = self.deps.editor.edit(
+                state["image_path"],
+                prompt,
+                mask_bytes=mask,
+                seed=self.deps.config.generator.seed,
+            )
+            image_path = self.deps.logger.write_edit_image(
+                state["iteration"], state["edit_attempts"] + 1, content
+            )
+            latency_ms = int((time.monotonic() - started) * 1000)
+            return {
+                "image_path": image_path,
+                "edit_attempts": state["edit_attempts"] + 1,
+                "editor_latency_ms": state["editor_latency_ms"] + latency_ms,
+                "actual_action": "local_edit",
+                "recommended_action": "",
+                "pending_edit": {},
+            }
+        except Exception as exc:
+            warnings = list(state["logs"])
+            warnings.append("Editor fallback: {}".format(exc))
+            return {
+                "recommended_action": "refine_prompt",
+                "actual_action": "editor_fallback",
+                "edit_attempts": state["edit_attempts"] + 1,
+                "pending_edit": {},
+                "logs": warnings,
+            }
 
     def memory_writer(self, state: AgentState) -> Dict[str, Any]:
         image_bytes = (
@@ -448,6 +568,11 @@ class GEMSNodes:
             suggested_fix=state["suggested_fix"],
             confidence=state["confidence"],
             ocr_score=state["ocr_score"],
+            ocr_diagnosis=state["ocr_diagnosis"],
+            recommended_action=state["recommended_action"],
+            actual_action=state["actual_action"],
+            edit_attempts=state["edit_attempts"],
+            editor_latency_ms=state["editor_latency_ms"],
             memory_summary=summary,
             latency_ms=state["generation_latency_ms"],
             errors=state["errors"],
@@ -505,6 +630,12 @@ class GEMSNodes:
                 state["attempt_history"]
             ),
             "ocr_score": state["ocr_score"],
+            "ocr_diagnosis": state["ocr_diagnosis"],
+            "recommended_action": state["recommended_action"],
+            "actual_action": state["actual_action"],
+            "generation_calls": state["iteration"],
+            "edit_attempts": state["edit_attempts"],
+            "editor_latency_ms": state["editor_latency_ms"],
             "errors": state["errors"],
         }
         report_path = self.deps.logger.write_json(
@@ -524,3 +655,27 @@ def _join_fixes(existing: str, new: str) -> str:
     if not new or new in existing:
         return existing
     return "{} {}".format(existing.rstrip(), new)
+
+
+def _pending_edit(diagnosis: Any, instances: List[Any]) -> Dict[str, Any]:
+    if diagnosis.recommended_action != "local_edit":
+        return {}
+    instance_by_id = {item.id: item for item in instances}
+    mismatches = [
+        item
+        for item in diagnosis.matches
+        if not item.passed and item.character_differences
+    ]
+    if len(mismatches) != 1:
+        return {}
+    match = mismatches[0]
+    instance = instance_by_id.get(match.detection_id)
+    if instance is None or not instance.polygon:
+        return {}
+    return {
+        "constraint_id": match.constraint_id,
+        "detection_id": match.detection_id,
+        "target_text": match.target_text,
+        "detected_text": match.detected_text,
+        "polygon": instance.polygon,
+    }

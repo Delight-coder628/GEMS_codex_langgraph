@@ -1,5 +1,6 @@
 import re
 import string
+from difflib import SequenceMatcher
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
@@ -100,6 +101,99 @@ class OCRScore:
         }
 
 
+@dataclass
+class TextConstraint:
+    id: str
+    text: str
+    language: str
+    reading_order: int
+    expected_region: Optional[List[float]] = None
+    font_family_class: Optional[str] = None
+    color: Optional[str] = None
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "id": self.id,
+            "text": self.text,
+            "language": self.language,
+            "reading_order": self.reading_order,
+            "expected_region": self.expected_region,
+            "font_family_class": self.font_family_class,
+            "color": self.color,
+        }
+
+
+@dataclass
+class DetectedTextInstance:
+    id: str
+    text: str
+    normalized_text: str
+    confidence: float
+    polygon: Optional[List[Any]]
+    reading_order: int
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "id": self.id,
+            "text": self.text,
+            "normalized_text": self.normalized_text,
+            "confidence": self.confidence,
+            "polygon": self.polygon,
+            "reading_order": self.reading_order,
+        }
+
+
+@dataclass
+class ConstraintMatch:
+    constraint_id: str
+    detection_id: str
+    target_text: str
+    detected_text: str
+    edit_distance: int
+    similarity: float
+    character_differences: List[Dict[str, str]]
+    passed: bool
+    confidence: float
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "constraint_id": self.constraint_id,
+            "detection_id": self.detection_id,
+            "target_text": self.target_text,
+            "detected_text": self.detected_text,
+            "edit_distance": self.edit_distance,
+            "similarity": self.similarity,
+            "character_differences": self.character_differences,
+            "passed": self.passed,
+            "confidence": self.confidence,
+        }
+
+
+@dataclass
+class OCRDiagnosis:
+    matches: List[ConstraintMatch]
+    missing_constraint_ids: List[str]
+    extra_detection_ids: List[str]
+    error_types: List[str]
+    passed: bool
+    suggested_fix: str
+    recommended_action: str
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "matches": [item.to_dict() for item in self.matches],
+            "missing_constraint_ids": self.missing_constraint_ids,
+            "extra_detection_ids": self.extra_detection_ids,
+            "error_types": self.error_types,
+            "passed": self.passed,
+            "suggested_fix": self.suggested_fix,
+            "recommended_action": self.recommended_action,
+            "passed_constraint_count": sum(item.passed for item in self.matches),
+            "total_constraint_count": len(self.matches)
+            + len(self.missing_constraint_ids),
+        }
+
+
 def extract_target_texts(prompt: str) -> List[str]:
     targets: List[str] = []
     for pattern in _QUOTED_PATTERNS:
@@ -111,6 +205,133 @@ def extract_target_texts(prompt: str) -> List[str]:
             _clean_target(match.group(1)) for match in pattern.finditer(prompt)
         )
     return _dedupe([target for target in targets if target])
+
+
+def build_text_constraints(targets: Sequence[str]) -> List[TextConstraint]:
+    return [
+        TextConstraint(
+            id="text_{:02d}".format(index),
+            text=target,
+            language=detect_language(target),
+            reading_order=index - 1,
+        )
+        for index, target in enumerate(targets, start=1)
+    ]
+
+
+def detect_language(value: str) -> str:
+    has_zh = bool(re.search(r"[\u3400-\u9fff]", value))
+    has_en = bool(re.search(r"[A-Za-z]", value))
+    if has_zh and has_en:
+        return "mixed"
+    if has_zh:
+        return "zh"
+    return "en"
+
+
+def build_detected_instances(ocr_result: OCRResult) -> List[DetectedTextInstance]:
+    indexed = list(enumerate(ocr_result.lines))
+    indexed.sort(key=lambda item: _reading_order_key(item[1], item[0]))
+    return [
+        DetectedTextInstance(
+            id="det_{:02d}".format(index),
+            text=line.text,
+            normalized_text=normalize_text(line.text),
+            confidence=line.confidence,
+            polygon=line.bbox,
+            reading_order=index - 1,
+        )
+        for index, (_, line) in enumerate(indexed, start=1)
+        if line.text
+    ]
+
+
+def diagnose_ocr_result(
+    constraints: Sequence[TextConstraint],
+    instances: Sequence[DetectedTextInstance],
+    min_confidence: float,
+    normalized_match_threshold: float,
+    editor_enabled: bool = False,
+) -> OCRDiagnosis:
+    candidates = []
+    for constraint in constraints:
+        for instance in instances:
+            similarity = _text_similarity(constraint.text, instance.text)
+            candidates.append((similarity, constraint.id, instance.id))
+    candidates.sort(key=lambda item: (-item[0], item[1], item[2]))
+
+    constraint_by_id = {item.id: item for item in constraints}
+    instance_by_id = {item.id: item for item in instances}
+    used_constraints = set()
+    used_instances = set()
+    pairs = []
+    for similarity, constraint_id, instance_id in candidates:
+        if constraint_id in used_constraints or instance_id in used_instances:
+            continue
+        used_constraints.add(constraint_id)
+        used_instances.add(instance_id)
+        pairs.append((constraint_id, instance_id, similarity))
+
+    matches = []
+    for constraint_id, instance_id, similarity in pairs:
+        constraint = constraint_by_id[constraint_id]
+        instance = instance_by_id[instance_id]
+        normalized_target = normalize_text(constraint.text)
+        normalized_detected = instance.normalized_text
+        distance = edit_distance(normalized_target, normalized_detected)
+        matches.append(
+            ConstraintMatch(
+                constraint_id=constraint_id,
+                detection_id=instance_id,
+                target_text=constraint.text,
+                detected_text=instance.text,
+                edit_distance=distance,
+                similarity=similarity,
+                character_differences=_character_differences(
+                    normalized_target, normalized_detected
+                ),
+                passed=(
+                    normalized_target == normalized_detected
+                    and instance.confidence >= min_confidence
+                ),
+                confidence=instance.confidence,
+            )
+        )
+    matches.sort(key=lambda item: constraint_by_id[item.constraint_id].reading_order)
+
+    missing = [item.id for item in constraints if item.id not in used_constraints]
+    extra = [item.id for item in instances if item.id not in used_instances]
+    error_types = []
+    if missing:
+        error_types.append("missing_text")
+    if extra:
+        error_types.append("extra_text")
+    if any(item.character_differences for item in matches):
+        error_types.append("content_mismatch")
+    if any(item.confidence < min_confidence for item in matches):
+        error_types.append("low_confidence")
+    matched_orders = [
+        instance_by_id[item.detection_id].reading_order for item in matches
+    ]
+    if matched_orders != sorted(matched_orders):
+        error_types.append("reading_order_error")
+
+    passed = bool(constraints) and not error_types and all(item.passed for item in matches)
+    suggested_fix = _diagnosis_fix(
+        constraints, instance_by_id, matches, missing, extra, error_types
+    )
+    action = _recommend_action(
+        matches, missing, error_types, instance_by_id, editor_enabled
+    )
+    return OCRDiagnosis(
+        matches=matches,
+        missing_constraint_ids=missing,
+        extra_detection_ids=extra,
+        error_types=error_types,
+        passed=passed,
+        suggested_fix=suggested_fix,
+        recommended_action=action,
+    )
 
 
 def normalize_text(value: str) -> str:
@@ -325,3 +546,98 @@ def _dedupe(values: Sequence[str]) -> List[str]:
 
 def _clean_target(value: str) -> str:
     return value.strip(" ：:，。,.!?！？;；\"'“”‘’「」『』")
+
+
+def _reading_order_key(line: OCRLine, fallback: int) -> Any:
+    polygon = line.bbox
+    if not isinstance(polygon, list) or not polygon:
+        return (1, fallback, fallback)
+    points = [
+        point
+        for point in polygon
+        if isinstance(point, (list, tuple)) and len(point) >= 2
+    ]
+    if not points:
+        return (1, fallback, fallback)
+    center_x = sum(_safe_float(point[0]) for point in points) / len(points)
+    center_y = sum(_safe_float(point[1]) for point in points) / len(points)
+    return (0, round(center_y / 10.0), center_x)
+
+
+def _text_similarity(left: str, right: str) -> float:
+    normalized_left = normalize_text(left)
+    normalized_right = normalize_text(right)
+    distance = edit_distance(normalized_left, normalized_right)
+    max_len = max(len(normalized_left), len(normalized_right), 1)
+    return max(0.0, min(1.0, 1.0 - distance / max_len))
+
+
+def _character_differences(left: str, right: str) -> List[Dict[str, str]]:
+    differences = []
+    matcher = SequenceMatcher(a=left, b=right, autojunk=False)
+    for tag, left_start, left_end, right_start, right_end in matcher.get_opcodes():
+        if tag == "equal":
+            continue
+        differences.append(
+            {
+                "operation": tag,
+                "expected": left[left_start:left_end],
+                "detected": right[right_start:right_end],
+            }
+        )
+    return differences
+
+
+def _diagnosis_fix(
+    constraints: Sequence[TextConstraint],
+    instance_by_id: Dict[str, DetectedTextInstance],
+    matches: Sequence[ConstraintMatch],
+    missing: Sequence[str],
+    extra: Sequence[str],
+    error_types: Sequence[str],
+) -> str:
+    if not error_types:
+        return ""
+    constraint_by_id = {item.id: item for item in constraints}
+    parts = []
+    if missing:
+        texts = [constraint_by_id[item].text for item in missing]
+        parts.append("Render the missing exact text: {}.".format(", ".join(texts)))
+    mismatches = [item for item in matches if item.character_differences]
+    for item in mismatches:
+        parts.append(
+            'Replace OCR text "{}" with the exact text "{}".'.format(
+                item.detected_text, item.target_text
+            )
+        )
+    if extra:
+        texts = [instance_by_id[item].text for item in extra]
+        parts.append("Remove unintended text: {}.".format(", ".join(texts)))
+    if "low_confidence" in error_types:
+        parts.append("Make the requested text larger, sharper, and higher contrast.")
+    if "reading_order_error" in error_types:
+        parts.append("Preserve the requested line and reading order.")
+    return " ".join(parts)
+
+
+def _recommend_action(
+    matches: Sequence[ConstraintMatch],
+    missing: Sequence[str],
+    error_types: Sequence[str],
+    instance_by_id: Dict[str, DetectedTextInstance],
+    editor_enabled: bool,
+) -> str:
+    if not error_types:
+        return "accept"
+    if "reading_order_error" in error_types or len(missing) > 1:
+        return "regenerate"
+    mismatches = [
+        item
+        for item in matches
+        if "content_mismatch" in error_types and item.character_differences
+    ]
+    if len(mismatches) == 1:
+        instance = instance_by_id[mismatches[0].detection_id]
+        if editor_enabled and instance.polygon:
+            return "local_edit"
+    return "refine_prompt"

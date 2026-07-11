@@ -26,6 +26,14 @@ class AgentState(TypedDict):
     confidence: float
     ocr_result: Dict[str, Any]
     ocr_score: Dict[str, Any]
+    ocr_constraints: List[Dict[str, Any]]
+    ocr_instances: List[Dict[str, Any]]
+    ocr_diagnosis: Dict[str, Any]
+    recommended_action: str
+    actual_action: str
+    edit_attempts: int
+    editor_latency_ms: int
+    pending_edit: Dict[str, Any]
     attempt_history: List[Dict[str, Any]]
     memory_summary: str
     logs: List[str]

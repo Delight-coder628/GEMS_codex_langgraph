@@ -54,6 +54,11 @@ class AttemptRecord(BaseModel):
     suggested_fix: str = ""
     confidence: float = 0.0
     ocr_score: dict = Field(default_factory=dict)
+    ocr_diagnosis: dict = Field(default_factory=dict)
+    recommended_action: str = ""
+    actual_action: str = ""
+    edit_attempts: int = 0
+    editor_latency_ms: int = 0
     memory_summary: str = ""
     latency_ms: int = 0
     errors: List[str] = Field(default_factory=list)
